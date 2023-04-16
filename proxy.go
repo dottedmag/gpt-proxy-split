@@ -63,7 +63,7 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, client *http.Client, k
 
 	// We do not use request's context, as we want to count requests that were aborted by the client too.
 	// Instead we use a new context with a timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	conn := mustGetDB(ctx, pool)
