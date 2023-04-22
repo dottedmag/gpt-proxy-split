@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -14,14 +15,17 @@ import (
 
 	"github.com/ridge/must/v2"
 	"github.com/tiktoken-go/tokenizer"
+	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitemigration"
 )
 
 const openaiURL = "https://api.openai.com"
 
 type completionRequestBody struct {
-	Model  string
-	Prompt string
+	Model    string
+	Messages []struct {
+		Content string
+	}
 	Suffix string
 	Stream bool
 }
@@ -29,6 +33,14 @@ type completionRequestBody struct {
 type completionResponseBody struct {
 	Usage struct {
 		TotalTokens int `json:"total_tokens"`
+	}
+}
+
+type completionResponseStreamedBody struct {
+	Choices []struct {
+		Delta struct {
+			Content string
+		}
 	}
 }
 
@@ -47,6 +59,129 @@ func logInfo(r *http.Request, fmt string, args ...any) {
 
 func logError(r *http.Request, fmt string, args ...any) {
 	reqPrint(r, "ERR ", fmt, args...)
+}
+
+func getMessageFromSSE(sseMsg string) string {
+	var msg string
+	for _, line := range strings.Split(sseMsg, "\n") {
+		if strings.HasPrefix(line, "data:") {
+			msg += strings.TrimSpace(line[5:])
+		}
+	}
+	return msg
+}
+
+func proxySSEResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, conn *sqlite.Conn, userName string, userID int64, projectName string, projectID int64, modelID int64, crb completionRequestBody, tk tokenizer.Codec) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		logError(r, "Unable to get flusher for response")
+		http.Error(w, "Streaming setup failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	nTokens := 0
+	for _, message := range crb.Messages {
+		ids, _, err := tk.Encode(message.Content)
+		if err != nil {
+			logError(r, "Failed to tokenize prompt for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
+			http.Error(w, "failed to tokenize prompt", http.StatusBadGateway)
+			return
+		}
+		nTokens += len(ids)
+	}
+
+	logInfo(r, "Tokenized prompt for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %d tokens", userName, userID, projectName, projectID, crb.Model, modelID, nTokens)
+
+	// Read the response line-by-line and send it to the client
+	reader := bufio.NewReader(resp.Body)
+	for {
+		var msg string
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				logError(r, "Failed to read response body for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
+				http.Error(w, "failed to read response", http.StatusBadGateway)
+				return
+			}
+			fmt.Fprint(w, line)
+			flusher.Flush()
+
+			if line == "\n" {
+				// End of message
+				break
+			}
+
+			if strings.HasPrefix(line, "data:") {
+				msg += strings.TrimSpace(line[5:])
+			}
+		}
+
+		if msg == "[DONE]" {
+			break
+		}
+
+		fmt.Printf("msg: %q\n", msg)
+
+		var respBody completionResponseStreamedBody
+		if err := json.Unmarshal([]byte(msg), &respBody); err != nil {
+			logError(r, "Failed to unmarshal response body for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
+			http.Error(w, "failed to unmarshal response", http.StatusBadGateway)
+			return
+		}
+		if len(respBody.Choices) != 1 {
+			logError(r, "0 or more than 1 choices in response body for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d)", userName, userID, projectName, projectID, crb.Model, modelID)
+			http.Error(w, "0 or more than 1 choices in response", http.StatusBadGateway)
+			return
+		}
+
+		ids, _, err := tk.Encode(respBody.Choices[0].Delta.Content)
+		if err != nil {
+			logError(r, "Failed to tokenize message for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
+			http.Error(w, "failed to tokenize message", http.StatusBadGateway)
+			return
+		}
+		nTokens += len(ids)
+	}
+
+	logInfo(r, "SSE response read. user %q (ID=%d), project %q (ID=%d), model %q (ID=%d), tokens %d", userName, userID, projectName, projectID, crb.Model, modelID, nTokens)
+
+	if err := saveUsage(conn, modelID, projectID, nTokens); err != nil {
+		logError(r, "Failed to save usage for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d), tokens %d: %v", userName, userID, projectName, projectID, crb.Model, modelID, nTokens, err)
+	}
+}
+
+func proxyPlainResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, conn *sqlite.Conn, userName string, userID int64, projectName string, projectID int64, modelID int64, crb completionRequestBody) {
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logError(r, "Failed to read response body for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
+		http.Error(w, "failed to read response", http.StatusBadGateway)
+		return
+	}
+
+	var crespb completionResponseBody
+	if err := json.Unmarshal(responseBody, &crespb); err != nil {
+		logError(r, "Failed to parse response body for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
+		http.Error(w, "failed to parse response", http.StatusBadGateway)
+		return
+	}
+
+	logInfo(r, "200 response read. user %q (ID=%d), project %q (ID=%d), model %q (ID=%d), tokens %d", userName, userID, projectName, projectID, crb.Model, modelID, crespb.Usage.TotalTokens)
+
+	if err := saveUsage(conn, modelID, projectID, crespb.Usage.TotalTokens); err != nil {
+		logError(r, "Failed to save usage for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d), tokens %d: %v", userName, userID, projectName, projectID, crb.Model, modelID, crespb.Usage.TotalTokens, err)
+	}
+
+	if _, err := w.Write(responseBody); err != nil {
+		logError(r, "Failed to write response body for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
+	}
+
+	logInfo(r, "200 response sent. user %q (ID=%d), project %q (ID=%d), model %q (ID=%d)", userName, userID, projectName, projectID, crb.Model, modelID)
 }
 
 func proxyRequest(w http.ResponseWriter, r *http.Request, client *http.Client, key string, pool *sqlitemigration.Pool) {
@@ -108,13 +243,7 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, client *http.Client, k
 		return
 	}
 
-	if crb.Stream {
-		logError(r, "Streaming is not supported, requested by user %q (ID=%d), project %q (ID=%d)", userName, userID, projectName, projectID)
-		http.Error(w, "streaming responses are not yet supported", http.StatusBadRequest)
-		return
-	}
-
-	_, err = tokenizer.ForModel(tokenizer.Model(crb.Model))
+	tk, err := tokenizer.ForModel(tokenizer.Model(crb.Model))
 	if err != nil {
 		logError(r, "Invalid model %q requested by user %q (ID=%d), project %q (ID=%d): %v", crb.Model, userName, userID, projectName, projectID, err)
 		http.Error(w, "failed to find model "+crb.Model, http.StatusBadRequest)
@@ -153,40 +282,20 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, client *http.Client, k
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	if resp.StatusCode == http.StatusOK {
-		responseBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			logError(r, "Failed to read response body for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
-			http.Error(w, "failed to read response", http.StatusBadGateway)
-			return
-		}
-
-		var crespb completionResponseBody
-		if err := json.Unmarshal(responseBody, &crespb); err != nil {
-			logError(r, "Failed to parse response body for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
-			http.Error(w, "failed to parse response", http.StatusBadGateway)
-			return
-		}
-
-		logInfo(r, "200 response read. user %q (ID=%d), project %q (ID=%d), model %q (ID=%d), tokens %d", userName, userID, projectName, projectID, crb.Model, modelID, crespb.Usage.TotalTokens)
-
-		if err := saveUsage(conn, modelID, projectID, crespb.Usage.TotalTokens); err != nil {
-			logError(r, "Failed to save usage for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d), tokens %d: %v", userName, userID, projectName, projectID, crb.Model, modelID, crespb.Usage.TotalTokens, err)
-		}
-
-		if _, err := w.Write(responseBody); err != nil {
+	if resp.StatusCode != http.StatusOK {
+		if _, err := io.Copy(w, resp.Body); err != nil {
 			logError(r, "Failed to write response body for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
 		}
 
-		logInfo(r, "200 response sent. user %q (ID=%d), project %q (ID=%d), model %q (ID=%d)", userName, userID, projectName, projectID, crb.Model, modelID)
+		logInfo(r, "Error response sent. %s, user %q (ID=%d), project %q (ID=%d), model %q (ID=%d)", resp.Status, userName, userID, projectName, projectID, crb.Model, modelID)
 		return
 	}
 
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		logError(r, "Failed to write response body for user %q (ID=%d), project %q (ID=%d), model %q (ID=%d): %v", userName, userID, projectName, projectID, crb.Model, modelID, err)
+	if crb.Stream {
+		proxySSEResponse(w, r, resp, conn, userName, userID, projectName, projectID, modelID, crb, tk)
+	} else {
+		proxyPlainResponse(w, r, resp, conn, userName, userID, projectName, projectID, modelID, crb)
 	}
-
-	logInfo(r, "Error response sent. %s, user %q (ID=%d), project %q (ID=%d), model %q (ID=%d)", resp.Status, userName, userID, projectName, projectID, crb.Model, modelID)
 }
 
 func serve(pool *sqlitemigration.Pool, listenURL string) {

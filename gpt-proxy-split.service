@@ -1,0 +1,14 @@
+[Unit]
+Description=gpt-proxy-split
+
+[Install]
+WantedBy=default.service
+
+[Service]
+Type=exec
+Restart=always
+
+Environment=TZ=Europe/Malta
+EnvironmentFile=/home/dottedmag/gpt-proxy-split/env
+ExecStart=/home/dottedmag/gpt-proxy-split/gpt-proxy-split serve 127.0.0.1:8889
+WorkingDirectory=/home/dottedmag/gpt-proxy-split

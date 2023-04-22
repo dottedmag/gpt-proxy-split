@@ -1,2 +1,4 @@
 *.db*
 gpt-proxy-split
+gpt-proxy-split.linux-amd64
+env
